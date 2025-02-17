@@ -1,37 +1,45 @@
 from datetime import datetime
 import numpy as np
 import pandas as pd
+import os
 import gc
-from data_utils import add_holidays, process_calendar, process_inventory
+from data_utils import add_holidays, process_calendar,process_inventory
 import lightgbm as lgb
+from sklearn.metrics import mean_absolute_error
+from embedding import spectral_encode
 
-class FinalSubmitter:
+# -------------------------
+# Validation Class
+# -------------------------
 
-    def __init__(self):
+class Validator:
 
-        train = get_train(test_ids_only=True)
-        test = get_test()
-        inventory = get_inventory()
-        calendar = get_calendar()
+    def __init__(self, dates=('05-01-2024', '05-15-2024')):
 
-        train = train.merge(
-            inventory, on=['unique_id', 'warehouse'], how='left')
-        train = train.merge(calendar, on=['date', 'warehouse'], how='left')
-
-        test = test.merge(inventory, on=['unique_id', 'warehouse'], how='left')
-        test = test.merge(calendar, on=['date', 'warehouse'], how='left')
+        df = get_train(test_ids_only=True)
+        df = df.merge(get_inventory(), on=[
+                      'unique_id', 'warehouse'], how='left')
+        df = df.merge(get_calendar(), on=['date', 'warehouse'], how='left')
 
         weights = pd.read_csv('./data/test_weights.csv')
-        train = train.merge(weights, on=['unique_id'], how='left')
-        test = test.merge(weights, on=['unique_id'], how='left')
+        df = df.merge(weights, on=['unique_id'], how='left')
 
-        train, test = double_fe(train, test)
-        self.train, self.test = self.__preprocess(train, test)
+        beg, end = dates
+        tra = df.loc[df['date'] <= beg],
+        val = df.loc[(df['date'] > beg) & (df['date'] <= end)]
 
+        tra, val = double_fe(tra, val, date_end=beg)
+        tra, val = self.__preprocess(tra, val)
+
+        tra['sales'] = np.sqrt(tra['discount_price'] * tra['sales'])
+        val['sales'] = np.sqrt(val['discount_price'] * val['sales'])
+
+        self.train = tra
+        self.valid = val
         self.model = None
-        return
 
     def __preprocess(self, train: pd.DataFrame, test: pd.DataFrame):
+
         drop_cols = ['mean_hol_sales']
 
         train.drop(drop_cols, axis=1, inplace=True)
@@ -45,72 +53,61 @@ class FinalSubmitter:
 
         return train, test
 
-    def build_model(self):
+    def build_model(self, params=None):
 
-        train_data = self.train
-        test_data = self.test
+        X_train = self.train.drop(['sales', 'date', 'weight'], axis=1)
+        y_train = self.train['sales']
 
-        X_train = train_data.drop(['sales', 'date', 'weight'], axis=1)
-        y_train = train_data['sales']
-        train_weights = train_data['weight']
-
-        X_test = test_data.drop(['date', 'weight'], axis=1)
+        X_valid = self.valid.drop(['sales', 'date', 'weight'], axis=1)
+        y_valid = self.valid['sales']
 
         categorical_cols = ['unique_id'] + \
             list(self.train.select_dtypes("object").columns)
 
         callbacks = [lgb.log_evaluation(period=100)]
 
-        params = {
-            'learning_rate': 0.04,
-            'num_leaves': 80,
-            'subsample': 0.7,
-            'colsample_bytree': 0.8528497905459008,
-            'reg_lambda': 0.3151110021900479,
-            'num_boost_round': 5000,
-            'objective': 'regression',
-            'metric': 'mae',
-            'boosting_type': 'gbdt',
-        }
+        if not params:
+            params = {
+                'learning_rate': 0.025,
+                'num_leaves': 50,  # 100,  # 150
+                'max_depth': 10,  # 12
+                'min_child_samples': 25,
+                'subsample': 0.7057135664023435,
+                'colsample_bytree': 0.8528497905459008,
+                'reg_alpha': 0.036786449788597686,
+                'reg_lambda': 0.3151110021900479,
+                'num_boost_round': 6000,
+                'objective': 'regression',
+                'metric': 'mae',
+                'boosting_type': 'gbdt'
+            }
 
         train_dataset = lgb.Dataset(X_train, label=y_train,
-                                    categorical_feature=categorical_cols,
-                                    weight=train_weights)
-
-        self.model = lgb.train(params,
-                               train_dataset,
-                               valid_sets=[train_dataset],
-                               valid_names=['train'],
-                               callbacks=callbacks)
-
-        y_pred = self.model.predict(
-            X_test.loc[self.test.index],
-            num_iteration=self.model.best_iteration)
-        sub = self.test.copy()
-        sub['sales'] = y_pred
-        sub[['unique_id', 'date', 'sales', 'weight']].to_csv("base_test_forecasts.csv", index=False)
-        return
-    
-    def get_training_errors(self):
-        X_train = self.train.drop(['sales', 'date', 'weight'], axis=1)
-
-        y_pred = self.model.predict(
-            X_train.loc[self.train.index], num_iteration=self.model.best_iteration)
-        
-        sub = self.train[['unique_id', 'date', 'sales', 'weight']].copy()
-        sub['pred'] = y_pred
-        sub['error'] = sub['weight'] * (sub['pred'] - sub['sales'])
-        sub[['unique_id', 'date', 'error']].to_csv(
-            "base_train_errors.csv", index=False)
+                                    categorical_feature=categorical_cols)
+        valid_dataset = lgb.Dataset(X_valid, label=y_valid,
+                                    categorical_feature=categorical_cols)
+        model = lgb.train(params,
+                          train_dataset,
+                          valid_sets=[train_dataset, valid_dataset],
+                          valid_names=['train', 'valid'],
+                          callbacks=callbacks)
+        y_pred = model.predict(X_valid, num_iteration=model.best_iteration)
+        y_p = y_pred**2 / X_valid['discount_price']
+        y_v = y_valid**2 / X_valid['discount_price']
+        weighted_mae = mean_absolute_error(y_v, y_p, sample_weight = X_valid['weight'])
+        print(f'Weight Mean Absolute Error: {weighted_mae}')
+        return model
 
 # --------------------------
 # Initializing Data
 # --------------------------
 
+
 def __sanitize_train(df: pd.DataFrame):
     df.dropna(inplace=True)
     df = df.drop('availability', axis=1)
     return df
+
 
 def get_train(test_ids_only=False):
     df = pd.read_csv('./data/sales_train.csv')
@@ -151,13 +148,14 @@ def get_calendar():
 
 def __date_features(df: pd.DataFrame):
     df['date'] = pd.to_datetime(df['date'])
-
     df['year'] = df['date'].dt.year
+
     df['day'] = df['date'].dt.day.clip(upper=30)
+
     df['dayofweek'] = df['date'].dt.dayofweek
-    df['dayofyear'] = df['date'].dt.dayofyear
-    
     df['weekend'] = (df['dayofweek'] > 4).astype(int)
+
+    df['dayofyear'] = df['date'].dt.dayofyear
 
     return df
 
@@ -174,7 +172,6 @@ def __price_features(df: pd.DataFrame):
 
     return df
 
-
 def feature_engineering(df: pd.DataFrame):
 
     discounts = [f'type_{i}_discount' for i in range(7)]
@@ -185,16 +182,6 @@ def feature_engineering(df: pd.DataFrame):
     df = __price_features(df)
 
     df['city'] = df['warehouse'].apply(lambda x: x.split('_')[0])
-    country = {
-        'Budapest_1': 'Hungary',
-        'Prague_2': 'Czechia',
-        'Brno_1': 'Czechia',
-        'Prague_1': 'Czechia',
-        'Prague_3': 'Czechia',
-        'Munich_1': 'Germany',
-        'Frankfurt_1': 'Germany'
-    }
-    df['country'] = df['warehouse'].apply(lambda x: country[x])
 
     return df
 
@@ -222,6 +209,7 @@ def create_relative_price(df: pd.DataFrame):
 
     return df
 
+
 def __modify_holiday(df: pd.DataFrame):
     # weekday holidays are more anamolous
     df['holiday'] = df['holiday'] + df['holiday'] * (1 - df['weekend'])
@@ -231,10 +219,7 @@ def __modify_holiday(df: pd.DataFrame):
 def __count_encoding(train: pd.DataFrame, test: pd.DataFrame):
     cols = ['unique_id', 'date', 'holiday_name',
             'warehouse', 'sell_price_main']
-    full = pd.concat([train[cols], test[cols]]).sort_values(
-        by=['unique_id', 'date'])
-    full['cum_count'] = full[['unique_id', 'date']
-                             ].groupby('unique_id').cumcount()
+    full = pd.concat([train[cols], test[cols]]).sort_values(by=['unique_id', 'date'])
 
     unique_prices = full[['unique_id', 'sell_price_main']]\
         .groupby('unique_id').nunique().reset_index()
@@ -250,7 +235,7 @@ def __count_encoding(train: pd.DataFrame, test: pd.DataFrame):
         counts.rename(columns={'count': f'{col}_count'}, inplace=True)
         full = full.merge(counts, how='left', on=col)
 
-    new_cols = [f'{col}_count' for col in cols] + ['price_counts', 'cum_count']
+    new_cols = [f'{col}_count' for col in cols] + ['price_counts']
     full = full[['unique_id', 'date'] + new_cols]
     gc.collect()
 
@@ -338,7 +323,6 @@ def __target_encoding(train: pd.DataFrame, test: pd.DataFrame):
 
     return train, test
 
-
 def __trend(train: pd.DataFrame, test: pd.DataFrame):
 
     all_cols = ['product_sales_14', 'product_sales_17', 'product_sales_21', 'product_sales_28',
@@ -355,9 +339,7 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
     drop_cols = ['intercept'] + [f'coef_{col}' for col in all_cols]
     train.drop(drop_cols, axis=1, inplace=True)
     test.drop(drop_cols, axis=1, inplace=True)
-
     gc.collect()
-
     # new
     nec_cols = ['product_sales_14', 'product_sales_21', 'product_sales_28', 'product_sales_35',
                 'weekday_avg_sales', 'week_trend', 'week_moving_trend', 'moving', 'normed_week_mean',
@@ -378,6 +360,11 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
 
 
 def __spectral_embedding(train: pd.DataFrame, test: pd.DataFrame):
+    file_path = "./id_embeddings.csv"
+    if not os.path.exists(file_path):
+        print('Spectral encoding...')
+        spectral_encode()
+
     embed = pd.read_csv('id_embeddings.csv')
 
     train = train.merge(embed, how='left', on='unique_id')
@@ -385,37 +372,48 @@ def __spectral_embedding(train: pd.DataFrame, test: pd.DataFrame):
 
     return train, test
 
-def double_fe(train: pd.DataFrame, test: pd.DataFrame):
+def __error_contribution(train: pd.DataFrame, test: pd.DataFrame):
+
+    train['diff'] = train['weight'] * \
+        (train['trend'] - train['sales']).apply(np.abs)
+
+    df = train[['unique_id', 'diff']].groupby('unique_id').mean().reset_index()
+    df.rename(columns={'diff': 'err_trend'}, inplace=True)
+
+    train.drop('diff', axis=1, inplace=True)
+
+    train = train.merge(df, how='left', on='unique_id')
+    test = test.merge(df, how='left', on='unique_id')
+
+    return train, test
+
+def double_fe(train: pd.DataFrame, test: pd.DataFrame, date_end=None):
 
     train, test = __target_encoding(train, test)
     train, test = __count_encoding(train, test)
 
     # df feature engineering
-    week_mean = train[['sales', 'year', 'city']].groupby(
-        ['year', 'city']).mean().reset_index()
+    week_mean = train[['sales', 'year', 'city']].groupby(['year', 'city']).mean().reset_index()
     week_mean.rename(columns={'sales': 'mean_sales'}, inplace=True)
 
     week_encoding = train[['dayofweek', 'sales', 'year', 'city']].groupby(
         ['year', 'dayofweek', 'city']).mean().reset_index()
     week_encoding.rename(columns={'sales': 'weekday_avg_sales'}, inplace=True)
-    week_encoding = week_encoding.merge(
-        week_mean, how='left', on=['year', 'city'])
+    week_encoding = week_encoding.merge(week_mean, how='left', on=['year', 'city'])
     week_encoding['weekday_frac_sales'] = week_encoding['weekday_avg_sales'] / \
         week_encoding['mean_sales']
     week_encoding.drop(['mean_sales', 'weekday_avg_sales'],
                        axis=1, inplace=True)
-
+    
     # lags
     PERIODS = [14, 17, 21, 28, 35, 42, 63, 91, 182, 364, 728]
     train_start = datetime.strptime(
         '08-01-2020', '%m-%d-%Y')
     train_end = datetime.strptime(
-        '06-02-2024', '%m-%d-%Y')
+        date_end, '%m-%d-%Y')
 
-    train_slice = train[['unique_id', 'date', 'sales',
-                         'year', 'dayofweek', 'total_orders', 'city']]
-    test_slice = test[['unique_id', 'date', 'year',
-                       'dayofweek', 'total_orders', 'city']].copy()
+    train_slice = train[['unique_id', 'date', 'sales', 'year', 'dayofweek', 'total_orders', 'city']]
+    test_slice = test[['unique_id', 'date', 'year', 'dayofweek', 'total_orders', 'city']].copy()
     test_slice['sales'] = 0
 
     combo = pd.concat([train_slice, test_slice],
@@ -424,9 +422,8 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame):
         combo[f'product_sales_{shift}'] = (combo.groupby('unique_id', observed=True)['sales']
                                            .transform(lambda x: x.shift(shift).fillna(0))
                                            )
-
-    df = combo.merge(week_encoding, how='left', on=[
-                     'year', 'dayofweek', 'city'])
+        
+    df = combo.merge(week_encoding, how='left', on=['year', 'dayofweek', 'city'])
     df = df.sort_values(['unique_id', 'date'])
     df['moving'] = (df.groupby('unique_id')['sales']
                     .transform(lambda x: x.shift(14).rolling(window=14, min_periods=1).mean().fillna(0))
@@ -449,8 +446,7 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame):
         grouped = df[['unique_id', 'sales', 'weekday_frac_sales']
                      ].groupby('unique_id')
         sales = grouped['sales'].transform(lambda x: x.shift(shift))
-        frac = grouped['weekday_frac_sales'].transform(
-            lambda x: x.shift(shift))
+        frac = grouped['weekday_frac_sales'].transform(lambda x: x.shift(shift))
         df[f'lag_{shift}'] = (numerator * sales / frac).fillna(0)
 
     df['normed_week_mean'] = df[['lag_14'] +
@@ -459,11 +455,10 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame):
                                   [f'lag_{i}' for i in DAY_PERIODS]].median(axis=1)
 
     df = df.drop([f'lag_{i}' for i in OFF_PERIODS], axis=1)
-    df = df.drop(['dayofweek', 'year', 'weekday_frac_sales',
-                 'total_orders', 'city'], axis=1)
+    df = df.drop(['dayofweek', 'year', 'weekday_frac_sales', 'total_orders', 'city'], axis=1)
 
     train_info = df.loc[(df['date'] >= train_start)
-                        & (df['date'] <= train_end)].drop('sales', axis=1)
+                           & (df['date'] <= train_end)].drop('sales', axis=1)
     test_info = df.loc[df['date'] > train_end].drop('sales', axis=1)
 
     train_info['date'] = pd.to_datetime(train_info['date'])
@@ -483,6 +478,8 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame):
     # spectral embedding
     train, test = __spectral_embedding(train, test)
 
-    train, test = __trend(train, test)
+    train, test = __trend(train, test, train_end)
+    # err_contr
+    train, test = __error_contribution(train, test)
 
     return train, test
