@@ -6,7 +6,7 @@ import gc
 from data_utils import add_holidays, process_calendar, process_inventory
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
-from embedding import spectral_encode
+from encoding import HierarchicalTargetEncoder, TargetEncoder, monthly_target_encode, spectral_encode
 
 # -------------------------
 # Validation Class
@@ -326,6 +326,38 @@ def __target_encoding(train: pd.DataFrame, test: pd.DataFrame):
     train['week_trend'] = train['weekday_frac_sales'] * train['prev_month_avg']
     test['week_trend'] = test['weekday_frac_sales'] * test['prev_month_avg']
 
+    gc.collect()
+
+    pairs = [
+        ('L1', 'L2'),
+        ('L1', 'L3'),
+        ('L1', 'L4'),
+        ('L1', 'product_unique_id'),
+        ('L2', 'product_unique_id'),
+        ('L3', 'product_unique_id'),
+        ('L4', 'product_unique_id'),
+        ('product_unique_id', 'unique_id'),
+        ('kind', 'product_unique_id'),
+        ('L1', 'kind')
+    ]
+    m_groups = ['L1', 'L2', 'L3', 'L4',
+                'unique_id', 'kind']
+    g_groups = ['L1', 'L2', 'L3', 'L4',
+                'product_unique_id', 'unique_id', 'kind']
+
+    train, test = monthly_target_encode(
+        train, test, group_cols=m_groups, prior_precision=10)
+
+    for grp in g_groups:
+        enc = TargetEncoder(grp)
+        train = enc.fit_transform(train)
+        test = enc.transform(test)
+
+    for p, c in pairs:
+        enc = HierarchicalTargetEncoder(p, c)
+        train = enc.fit_transform(train)
+        test = enc.transform(test)
+
     return train, test
 
 
@@ -346,18 +378,35 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
     train.drop(drop_cols, axis=1, inplace=True)
     test.drop(drop_cols, axis=1, inplace=True)
     gc.collect()
-    # new
+    # 2
     nec_cols = ['product_sales_14', 'product_sales_21', 'product_sales_28', 'product_sales_35',
                 'weekday_avg_sales', 'week_trend', 'week_moving_trend', 'moving', 'normed_week_mean',
                 'normed_week_median'] + [f'lag_{i}' for i in [14, 21, 28, 35]]
     coef_df = pd.read_csv('./trend_coefs_new.csv')
     train = train.merge(coef_df, how='left', on='unique_id')
     test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend_new'] = train['intercept'] * train['sell_price_main']
-    test['trend_new'] = test['intercept'] * test['sell_price_main'] ################### weight-scaled
+    train['trend_2'] = train['intercept'] * train['sell_price_main']
+    test['trend_2'] = test['intercept'] * test['sell_price_main'] ################### weight-scaled
     for col in nec_cols:
-        train['trend'] += train[col].fillna(0) * train[f'coef_{col}']
-        test['trend'] += test[col].fillna(0) * test[f'coef_{col}']
+        train['trend_2'] += train[col].fillna(0) * train[f'coef_{col}']
+        test['trend_2'] += test[col].fillna(0) * test[f'coef_{col}']
+    drop_cols = ['intercept'] + [f'coef_{col}' for col in nec_cols]
+    train.drop(drop_cols, axis=1, inplace=True)
+    test.drop(drop_cols, axis=1, inplace=True)
+    gc.collect()
+
+    # newest
+    nec_cols = ['product_sales_14', 'product_sales_21', 'product_sales_28', 'product_sales_35',
+                'weekday_avg_sales', 'week_trend', 'week_moving_trend', 'moving', 'normed_week_mean',
+                'normed_week_median', 'discount_amount'] + [f'lag_{i}' for i in [14, 21, 28, 35]]
+    coef_df = pd.read_csv('./trend_coefs.csv')
+    train = train.merge(coef_df, how='left', on='unique_id')
+    test = test.merge(coef_df, how='left', on='unique_id')
+    train['trend_3'] = train['intercept']
+    test['trend_3'] = test['intercept']
+    for col in nec_cols:
+        train['trend_3'] += train[col].fillna(0) * train[f'coef_{col}']
+        test['trend_3'] += test[col].fillna(0) * test[f'coef_{col}']
     drop_cols = ['intercept'] + [f'coef_{col}' for col in nec_cols]
     train.drop(drop_cols, axis=1, inplace=True)
     test.drop(drop_cols, axis=1, inplace=True)
