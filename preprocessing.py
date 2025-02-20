@@ -25,6 +25,8 @@ class Validator:
         weights = pd.read_csv('./data/test_weights.csv')
         df = df.merge(weights, on=['unique_id'], how='left')
 
+        df['sales'] = df['sales'] * df['sell_price_main'] ################ weighted!
+
         beg, end = dates
         tra = df.loc[df['date'] <= beg]
         val = df.loc[(df['date'] > beg) & (df['date'] <= end)]
@@ -32,8 +34,8 @@ class Validator:
         tra, val = double_fe(tra, val, date_end=beg)
         tra, val = self.__preprocess(tra, val)
 
-        tra['sales'] = np.sqrt(tra['discount_price'] * tra['sales'])
-        val['sales'] = np.sqrt(val['discount_price'] * val['sales'])
+        tra['sales'] = np.sqrt(tra['sales'])
+        val['sales'] = np.sqrt(val['sales'])
 
         self.train = tra
         self.valid = val
@@ -93,8 +95,8 @@ class Validator:
                                valid_names=['train', 'valid'],
                                callbacks=callbacks)
         y_pred = self.model.predict(X_valid, num_iteration=self.model.best_iteration)
-        y_p = y_pred**2 / X_valid['discount_price']
-        y_v = y_valid**2 / X_valid['discount_price']
+        y_p = y_pred**2 / X_valid['sell_price_main']
+        y_v = y_valid**2 / X_valid['sell_price_main']
         weighted_mae = mean_absolute_error(
             y_v, y_p, sample_weight=self.valid.loc[X_valid.index, 'weight'])
         print(f'Weight Mean Absolute Error: {weighted_mae}')
@@ -335,8 +337,8 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
     coef_df = pd.read_csv('./trend_coefs_14.csv')
     train = train.merge(coef_df, how='left', on='unique_id')
     test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend'] = train['intercept']
-    test['trend'] = test['intercept']
+    train['trend'] = train['intercept'] * train['sell_price_main'] ############### On weighted-scale
+    test['trend'] = test['intercept'] * test['sell_price_main']
     for col in all_cols:
         train['trend'] += train[col].fillna(0) * train[f'coef_{col}']
         test['trend'] += test[col].fillna(0) * test[f'coef_{col}']
@@ -351,8 +353,8 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
     coef_df = pd.read_csv('./trend_coefs_new.csv')
     train = train.merge(coef_df, how='left', on='unique_id')
     test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend_new'] = train['intercept']
-    test['trend_new'] = test['intercept']
+    train['trend_new'] = train['intercept'] * train['sell_price_main']
+    test['trend_new'] = test['intercept'] * test['sell_price_main'] ################### weight-scaled
     for col in nec_cols:
         train['trend'] += train[col].fillna(0) * train[f'coef_{col}']
         test['trend'] += test[col].fillna(0) * test[f'coef_{col}']
