@@ -9,9 +9,112 @@ from sklearn.metrics import mean_absolute_error
 from encoding import HierarchicalTargetEncoder, TargetEncoder, monthly_target_encode, spectral_encode
 
 # -------------------------
-# Validation Class
+# Submitter Class
 # -------------------------
 
+
+class Submitter:
+
+    def __init__(self):
+
+        train = get_train(test_ids_only=True)
+        test = get_test()
+
+        inv = get_inventory()
+        train = train.merge(inv, on=['unique_id', 'warehouse'], how='left')
+        test = test.merge(inv, on=['unique_id', 'warehouse'], how='left')
+
+        cal = get_calendar()
+        train = train.merge(cal, on=['date', 'warehouse'], how='left')
+        test = test.merge(cal, on=['date', 'warehouse'], how='left')
+
+        weights = pd.read_csv('./data/test_weights.csv')
+        train = train.merge(weights, on=['unique_id'], how='left')
+        test = test.merge(weights, on=['unique_id'], how='left')
+
+        warehouse_weight = {
+            'Brno_1': 0.060415,
+            'Budapest_1': 0.002977,
+            'Frankfurt_1': 1.355029,
+            'Munich_1': 1.762047,
+            'Prague_1': 0.066596,
+            'Prague_2': 0.038047,
+            'Prague_3': 0.031790
+        }
+
+        train['ware_wgt'] = train['warehouse'].apply(lambda x: warehouse_weight[x])
+        test['ware_wgt'] = test['warehouse'].apply(lambda x: warehouse_weight[x])
+
+        train['sales'] = train['sales'] * train['sell_price_main'] * train['ware_wgt']  # weighted!
+
+        train, test = double_fe(train, test, date_end='06-02-2024')
+        train, test = self.__preprocess(train, test)
+
+        train['sales'] = np.sqrt(train['sales'])
+
+        self.train = train
+        self.test = test
+        self.model = None
+
+    def __preprocess(self, train: pd.DataFrame, test: pd.DataFrame):
+
+        categorical_columns = ['unique_id'] + \
+            list(train.select_dtypes("object").columns)
+        for col in categorical_columns:
+            train[col] = train[col].astype('category')
+            test[col] = test[col].astype('category')
+
+        return train, test
+
+    def build_model(self, params=None):
+
+        X_train = self.train.drop(['sales', 'date', 'weight'], axis=1)
+        y_train = self.train['sales']
+
+        X_test = self.test.drop(['date', 'weight'], axis=1)[X_train.columns]
+
+        categorical_cols = ['unique_id'] + \
+            list(self.train.select_dtypes("object").columns)
+
+        callbacks = [lgb.log_evaluation(period=100)]
+
+        if not params:
+            params = {
+                'objective': 'l2',
+                'verbosity': -1,
+                'n_iter': 5000,
+                'lambda_l1': 0.8942112689465215,
+                'lambda_l2': 6.4122663335284305,
+                'learning_rate': 0.01,
+                'max_depth': 11,
+                'num_leaves': 273,
+                'colsample_bytree': 0.6,
+                'colsample_bynode': 0.8,
+                'min_data_in_leaf': 6,
+                'max_cat_threshold': 952,
+            }
+
+        train_dataset = lgb.Dataset(X_train, label=y_train,
+                                    categorical_feature=categorical_cols)
+        
+        self.model = lgb.train(params,
+                               train_dataset,
+                               valid_sets=[train_dataset],
+                               valid_names=['train'],
+                               callbacks=callbacks)
+        
+        y_pred = self.model.predict(
+            X_test.loc[self.test.index], num_iteration=self.model.best_iteration)
+        y_p = y_pred**2 / (X_test.loc[self.test.index, 'sell_price_main'] * X_test.loc[self.test.index, 'ware_wgt'])
+
+        sub = self.test.copy()
+        sub['sales_hat'] = y_p
+        sub['id'] = sub['unique_id'].astype(str) + '_' + sub['date'].astype(str)
+        sub[['id', 'sales_hat']].to_csv("submission.csv", index=False)
+
+# -------------------------
+# Validation Class
+# -------------------------
 
 class Validator:
 
@@ -25,7 +128,18 @@ class Validator:
         weights = pd.read_csv('./data/test_weights.csv')
         df = df.merge(weights, on=['unique_id'], how='left')
 
-        df['sales'] = df['sales'] * df['sell_price_main'] ################ weighted!
+        warehouse_weight = {
+            'Brno_1': 0.060415,
+            'Budapest_1': 0.002977,
+            'Frankfurt_1': 1.355029,
+            'Munich_1': 1.762047,
+            'Prague_1': 0.066596,
+            'Prague_2': 0.038047,
+            'Prague_3': 0.031790
+        }
+
+        df['ware_wgt'] = df['warehouse'].apply(lambda x: warehouse_weight[x])
+        df['sales'] = df['sales'] * df['sell_price_main'] * df['ware_wgt'] # weighted!
 
         beg, end = dates
         tra = df.loc[df['date'] <= beg]
@@ -42,11 +156,6 @@ class Validator:
         self.model = None
 
     def __preprocess(self, train: pd.DataFrame, test: pd.DataFrame):
-
-        drop_cols = ['mean_hol_sales']
-
-        train.drop(drop_cols, axis=1, inplace=True)
-        test.drop(drop_cols, axis=1, inplace=True)
 
         categorical_columns = ['unique_id'] + \
             list(train.select_dtypes("object").columns)
@@ -95,8 +204,8 @@ class Validator:
                                valid_names=['train', 'valid'],
                                callbacks=callbacks)
         y_pred = self.model.predict(X_valid, num_iteration=self.model.best_iteration)
-        y_p = y_pred**2 / X_valid['sell_price_main']
-        y_v = y_valid**2 / X_valid['sell_price_main']
+        y_p = y_pred**2 / (X_valid['sell_price_main'] * X_valid['ware_wgt'])
+        y_v = y_valid**2 / (X_valid['sell_price_main'] * X_valid['ware_wgt'])
         weighted_mae = mean_absolute_error(
             y_v, y_p, sample_weight=self.valid.loc[X_valid.index, 'weight'])
         print(f'Weight Mean Absolute Error: {weighted_mae}')
@@ -288,19 +397,13 @@ def __target_encoding(train: pd.DataFrame, test: pd.DataFrame):
     hol_stats = pd.concat(
         [mean_hol_id, std_hol_id.loc[:, 'std_hol_sales']], axis=1)
     hol_stats['log_cv'] = (hol_stats['std_hol_sales'] / hol_stats['mean_hol_sales']
-                           ).fillna(0).apply(lambda x: np.log(x + 1e-3))
+                           ).fillna(0)
 
-    keep_cols = ['mean_hol_sales', 'std_hol_sales',
-                 'unique_id', 'holiday_name', 'log_cv']
+    keep_cols = ['std_hol_sales', 'unique_id', 'holiday_name', 'log_cv']
     train = train.merge(hol_stats[keep_cols], how='left', on=[
                         'unique_id', 'holiday_name'])
     test = test.merge(hol_stats[keep_cols], how='left', on=[
                       'unique_id', 'holiday_name'])
-
-    gc.collect()
-
-    train['weighted_std'] = train['std_hol_sales'] * train['weight']
-    test['weighted_std'] = test['std_hol_sales'] * test['weight']
 
     gc.collect()
 
@@ -332,21 +435,19 @@ def __target_encoding(train: pd.DataFrame, test: pd.DataFrame):
         ('L1', 'L2'),
         ('L1', 'L3'),
         ('L1', 'L4'),
-        ('L1', 'product_unique_id'),
-        ('L2', 'product_unique_id'),
-        ('L3', 'product_unique_id'),
-        ('L4', 'product_unique_id'),
-        ('product_unique_id', 'unique_id'),
-        ('kind', 'product_unique_id'),
+        ('L1', 'unique_id'),
+        ('L2', 'unique_id'),
+        ('L3', 'unique_id'),
+        ('L4', 'unique_id'),
+        ('kind', 'unique_id'),
         ('L1', 'kind')
     ]
     m_groups = ['L1', 'L2', 'L3', 'L4',
                 'unique_id', 'kind']
     g_groups = ['L1', 'L2', 'L3', 'L4',
-                'product_unique_id', 'unique_id', 'kind']
+                'unique_id', 'kind']
 
-    train, test = monthly_target_encode(
-        train, test, group_cols=m_groups, prior_precision=10)
+    train, test = monthly_target_encode(train, test, group_cols=m_groups)
 
     for grp in g_groups:
         enc = TargetEncoder(grp)
@@ -369,11 +470,11 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
     coef_df = pd.read_csv('./trend_coefs_14.csv')
     train = train.merge(coef_df, how='left', on='unique_id')
     test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend'] = train['intercept'] * train['sell_price_main'] ############### On weighted-scale
-    test['trend'] = test['intercept'] * test['sell_price_main']
+    train['trend_1'] = train['intercept'] * train['sell_price_main'] * train['ware_wgt'] ############### On weighted-scale
+    test['trend_1'] = test['intercept'] * test['sell_price_main'] * test['ware_wgt']
     for col in all_cols:
-        train['trend'] += train[col].fillna(0) * train[f'coef_{col}']
-        test['trend'] += test[col].fillna(0) * test[f'coef_{col}']
+        train['trend_1'] += train[col].fillna(0) * train[f'coef_{col}']
+        test['trend_1'] += test[col].fillna(0) * test[f'coef_{col}']
     drop_cols = ['intercept'] + [f'coef_{col}' for col in all_cols]
     train.drop(drop_cols, axis=1, inplace=True)
     test.drop(drop_cols, axis=1, inplace=True)
@@ -385,8 +486,8 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
     coef_df = pd.read_csv('./trend_coefs_new.csv')
     train = train.merge(coef_df, how='left', on='unique_id')
     test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend_2'] = train['intercept'] * train['sell_price_main']
-    test['trend_2'] = test['intercept'] * test['sell_price_main'] ################### weight-scaled
+    train['trend_2'] = train['intercept'] * train['sell_price_main'] * train['ware_wgt']
+    test['trend_2'] = test['intercept'] * test['sell_price_main'] * test['ware_wgt']  # weight-scaled
     for col in nec_cols:
         train['trend_2'] += train[col].fillna(0) * train[f'coef_{col}']
         test['trend_2'] += test[col].fillna(0) * test[f'coef_{col}']
@@ -404,9 +505,9 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame):
     test = test.merge(coef_df, how='left', on='unique_id')
     train['trend_3'] = train['intercept']
     test['trend_3'] = test['intercept']
-    for col in nec_cols:
-        train['trend_3'] += train[col].fillna(0) * train[f'coef_{col}']
-        test['trend_3'] += test[col].fillna(0) * test[f'coef_{col}']
+    for col in nec_cols: # PRE-WEIGHTED
+        train['trend_3'] += np.sqrt(train[col].fillna(0)) * train[f'coef_{col}']
+        test['trend_3'] += np.sqrt(test[col].fillna(0)) * test[f'coef_{col}']
     drop_cols = ['intercept'] + [f'coef_{col}' for col in nec_cols]
     train.drop(drop_cols, axis=1, inplace=True)
     test.drop(drop_cols, axis=1, inplace=True)

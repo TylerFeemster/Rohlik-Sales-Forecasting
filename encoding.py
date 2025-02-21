@@ -10,15 +10,15 @@ class TargetEncoder:
         self.target = target_col
 
     def fit(self, df):
-        slice = df[[self.group, self.target]]
-        self.stats = slice.groupby(self.group).agg(
+        slice = df[[self.group, 'warehouse', self.target]]
+        self.stats = slice.groupby([self.group, 'warehouse']).agg(
             n=(self.target, "count"),
             mu_mle=(self.target, "mean"),
             sig2_mle=(self.target, "var"))
         self.stats['mu_prior'] = df[self.target].mean()
         return
 
-    def transform(self, df, prior_precision=20):
+    def transform(self, df, prior_precision=5):
 
         post_precision = self.stats.n / self.stats.sig2_mle
         precision = prior_precision + post_precision
@@ -30,7 +30,7 @@ class TargetEncoder:
         new_vals = ((numer / denom).reset_index())\
             .rename(columns={0: f'GTE_{self.group}'})
 
-        df = df.merge(new_vals, how='left', on=self.group)
+        df = df.merge(new_vals, how='left', on=[self.group, 'warehouse'])
         return df
 
     def fit_transform(self, df, *args, **kwargs):
@@ -46,21 +46,21 @@ class HierarchicalTargetEncoder:
         self.target = target_col
 
     def __get_priors(self, df):
-        return df[[self.parent, self.target]].groupby(self.parent).mean()\
+        return df[[self.parent, 'warehouse', self.target]].groupby([self.parent, 'warehouse']).mean()\
             .reset_index().rename(columns={self.target: 'mu_prior'})
 
     def fit(self, df):
-        slice = df[[self.parent, self.child, self.target]]
+        slice = df[[self.parent, self.child, 'warehouse', self.target]]
         slice = slice.merge(self.__get_priors(
-            slice), how='left', on=self.parent)
-        self.stats = slice.groupby(self.child).agg(
+            slice), how='left', on=[self.parent, 'warehouse'])
+        self.stats = slice.groupby([self.child, 'warehouse']).agg(
             n=(self.target, "count"),
             mu_mle=(self.target, "mean"),
             sig2_mle=(self.target, "var"),
             mu_prior=('mu_prior', "mean"))
         return
 
-    def transform(self, df, prior_precision=20):
+    def transform(self, df, prior_precision=5):
 
         post_precision = self.stats.n / self.stats.sig2_mle
         precision = prior_precision + post_precision
@@ -72,7 +72,7 @@ class HierarchicalTargetEncoder:
         new_vals = ((numer / denom).reset_index()
                     ).rename(columns={0: f'HTE_{self.child}/{self.parent}'})
 
-        df = df.merge(new_vals, how='left', on=self.child)
+        df = df.merge(new_vals, how='left', on=[self.child, 'warehouse'])
         return df
 
     def fit_transform(self, df, *args, **kwargs):
@@ -81,7 +81,7 @@ class HierarchicalTargetEncoder:
 
 
 def monthly_target_encode(train: pd.DataFrame, test: pd.DataFrame, group_cols=[],
-                          target_col='sales', prior_precision=10):
+                          target_col='sales', prior_precision=5):
     train = train.copy()
     test = test.copy()
     train['mnth'] = train['date'].dt.to_period('M')
