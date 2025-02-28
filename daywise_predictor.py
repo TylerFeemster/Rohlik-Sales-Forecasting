@@ -5,6 +5,7 @@ import gc
 from data_utils import add_holidays, process_calendar, process_inventory
 import lightgbm as lgb
 
+
 class FinalSubmitter:
 
     def __init__(self):
@@ -88,20 +89,9 @@ class FinalSubmitter:
             num_iteration=self.model.best_iteration)
         sub = self.test.copy()
         sub['sales'] = y_pred
-        sub[['unique_id', 'date', 'sales', 'weight']].to_csv("base_test_forecasts.csv", index=False)
+        sub[['unique_id', 'date', 'sales', 'weight']].to_csv(
+            "base_test_forecasts.csv", index=False)
         return
-    
-    def get_training_errors(self):
-        X_train = self.train.drop(['sales', 'date', 'weight'], axis=1)
-
-        y_pred = self.model.predict(
-            X_train.loc[self.train.index], num_iteration=self.model.best_iteration)
-        
-        sub = self.train[['unique_id', 'date', 'sales', 'weight']].copy()
-        sub['pred'] = y_pred
-        sub['error'] = sub['weight'] * (sub['pred'] - sub['sales'])
-        sub[['unique_id', 'date', 'error']].to_csv(
-            "base_train_errors.csv", index=False)
 
 # --------------------------
 # Initializing Data
@@ -111,6 +101,7 @@ class FinalSubmitter:
 def __sanitize_train(df: pd.DataFrame):
     df = df.fillna(0)
     return df
+
 
 def get_train(test_ids_only=False):
     df = pd.read_csv('./data/sales_train.csv')
@@ -156,7 +147,7 @@ def __date_features(df: pd.DataFrame):
     df['day'] = df['date'].dt.day.clip(upper=30)
     df['dayofweek'] = df['date'].dt.dayofweek
     df['dayofyear'] = df['date'].dt.dayofyear
-    
+
     df['weekend'] = (df['dayofweek'] > 4).astype(int)
 
     return df
@@ -238,15 +229,15 @@ def __relative_price(df: pd.DataFrame):
         temp = df[['date', 'warehouse', 'availability', col]]
         temp['avg_avail'] = temp.groupby(['warehouse', col, 'date'], observed=True)\
             .transform('mean')['availability']
-        temp[f'relative_avail_{col}'] = temp['availability'] - \
-            temp['avg_avail']
+        temp[f'relative_avail_{col}'] = temp['availability'] - temp['avg_avail']
 
         df = df.merge(temp[[f'relative_avail_{col}', 'date', 'warehouse', col]],
                       how='left', on=['date', 'warehouse', col])
-
+    
     df = df.drop('availability', axis=1)
 
     return df
+
 
 def __modify_holiday(df: pd.DataFrame):
     # weekday holidays are more anamolous
@@ -410,6 +401,7 @@ def __spectral_embedding(train: pd.DataFrame, test: pd.DataFrame):
     test = test.merge(embed, how='left', on='unique_id')
 
     return train, test
+
 
 def double_fe(train: pd.DataFrame, test: pd.DataFrame):
 

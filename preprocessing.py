@@ -143,7 +143,8 @@ class Validator:
 
         beg, end = dates
         tra = df.loc[df['date'] <= beg]
-        val = df.loc[(df['date'] > beg) & (df['date'] <= end)]
+        val = df.loc[(df['date'] > beg) & (df['date'] <= end)].copy()
+        val['availability'] = 1
 
         tra, val = double_fe(tra, val, date_end=beg)
         tra, val = self.__preprocess(tra, val)
@@ -216,8 +217,7 @@ class Validator:
 
 
 def __sanitize_train(df: pd.DataFrame):
-    df.dropna(inplace=True)
-    df = df.drop('availability', axis=1)
+    df = df.fillna(0)
     return df
 
 
@@ -282,6 +282,17 @@ def __price_features(df: pd.DataFrame):
     df['order_price_ratio'] = df['total_orders'] / df['sell_price_main']
     df['order_discount_ratio'] = df['total_orders'] / df['discount_price']
 
+    mean_prices = df.groupby(df['unique_id'])['sell_price_main'].mean()
+    std_prices = df.groupby(df['unique_id'])['sell_price_main'].std()
+    df['price_scaled'] = np.where(df['unique_id'].map(std_prices) == 0, 0,
+                                  (df['sell_price_main'] - df['unique_id'].map(mean_prices))/df['unique_id'].map(std_prices))
+    df['days_since_2020'] = (
+        df['date'] - pd.to_datetime('2020-01-01')).dt.days.astype('int')
+    df['price_detrended'] = df['price_scaled'] - \
+        df.groupby(['days_since_2020', 'warehouse'])[
+        'price_scaled'].transform('mean')
+    df = df.drop(['price_scaled', 'days_since_2020'], axis=1)
+
     return df
 
 
@@ -299,14 +310,13 @@ def feature_engineering(df: pd.DataFrame):
     return df
 
 
-def create_relative_price(df: pd.DataFrame):
-    cols = [f'L{i}' for i in range(2, 5)] + ['kind']
+def __relative_price(df: pd.DataFrame):
+    cols = [f'L{i}' for i in range(1, 5)] + ['kind']
     for col in cols:
         temp = df[['date', 'warehouse', 'discount_price', col]]
         stats = temp.groupby(
-            ['warehouse', col, 'date'], observed=True).min().reset_index()
-        stats['min'] = stats['discount_price']  # name fix
-        stats = stats.drop('discount_price', axis=1)
+            ['warehouse', col, 'date'], observed=True).min().reset_index()\
+                .rename(columns={'discount_price': 'min'})
 
         mean_df = temp.groupby(['warehouse', col, 'date'],
                                observed=True).mean().reset_index()
@@ -319,6 +329,18 @@ def create_relative_price(df: pd.DataFrame):
         # for category, date, and warehouse, asks if least price (takes into account current discounts)
         df[f'relative_price_{col}'] = ((merged['discount_price'] - merged['min'])
                                        / (merged['mean'] - merged['min'])).fillna(1)
+    
+    if 'availability' not in df.columns.to_list():
+        df['availability'] = 1
+
+    for col in cols:
+        means = df.groupby(['warehouse', col, 'date'], observed=True)[
+            'availability'].mean().reset_index().rename(columns={'availability': f'relative_avail_{col}'})
+        df = df.merge(means, how='left', on=['warehouse', col, 'date'])
+        df[f'relative_avail_{col}'] = df['availability'] - \
+            df[f'relative_avail_{col}']
+
+    df = df.drop('availability', axis=1)
 
     return df
 
@@ -618,8 +640,8 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame, date_end=None):
 
     gc.collect()
 
-    train = create_relative_price(train)
-    test = create_relative_price(test)
+    train = __relative_price(train)
+    test = __relative_price(test)
 
     train = __modify_holiday(train)
     test = __modify_holiday(test)
