@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import os
 import gc
+from convex import linear_trend
 from data_utils import add_holidays, process_calendar, process_inventory
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
@@ -273,7 +274,7 @@ def __date_features(df: pd.DataFrame):
 
 
 def __price_features(df: pd.DataFrame):
-    discounts = [f'type_{i}_discount' for i in range(7)]
+    discounts = [f'type_{i}_discount' for i in range(6)] # ignore discount 6
     df['top_discount'] = df[discounts].max(axis=1)
     df['discount_price'] = df['sell_price_main'] * (1 - df['top_discount'])
     df['discount_amount'] = df['sell_price_main'] * df['top_discount']
@@ -311,25 +312,19 @@ def feature_engineering(df: pd.DataFrame):
 
 
 def __relative_price(df: pd.DataFrame):
-    cols = [f'L{i}' for i in range(1, 5)] + ['kind']
+    cols = [f'L{i}' for i in range(2, 5)] + ['kind']
     for col in cols:
         temp = df[['date', 'warehouse', 'discount_price', col]]
         stats = temp.groupby(
-            ['warehouse', col, 'date'], observed=True).min().reset_index()\
-                .rename(columns={'discount_price': 'min'})
-
-        mean_df = temp.groupby(['warehouse', col, 'date'],
-                               observed=True).mean().reset_index()
-        stats['mean'] = mean_df['discount_price']
-        gc.collect()
+            ['warehouse', col, 'date'], observed=True).mean().reset_index()\
+                .rename(columns={'discount_price': 'mean'})
 
         merged = temp.merge(stats, how='left',
                             on=['warehouse', col, 'date'])
 
-        # for category, date, and warehouse, asks if least price (takes into account current discounts)
-        df[f'relative_price_{col}'] = ((merged['discount_price'] - merged['min'])
-                                       / (merged['mean'] - merged['min'])).fillna(1)
+        df[f'relative_price_{col}'] = (merged['discount_price'] - merged['mean']) / merged['mean']
     
+    # not so good \/
     if 'availability' not in df.columns.to_list():
         df['availability'] = 1
 
@@ -484,53 +479,27 @@ def __target_encoding(train: pd.DataFrame, test: pd.DataFrame):
     return train, test
 
 
-def __trend(train: pd.DataFrame, test: pd.DataFrame):
+def __trend(train: pd.DataFrame, test: pd.DataFrame, days_from_train: int = 14):
 
-    all_cols = ['product_sales_14', 'product_sales_17', 'product_sales_21', 'product_sales_28',
-                'product_sales_35', 'product_sales_42', 'weekday_avg_sales', 'week_trend']
-    # all
-    coef_df = pd.read_csv('./trend_coefs_14.csv')
+    all_cols = [f'lag_{i}' for i in list(range(days_from_train, 15)) + [21, 28, 35]] \
+        + [f'product_sales_{i}' for i in list(range(days_from_train, 22)) + [28, 35]] \
+        + ['weekday_avg_sales', 'total_orders', 'moving', 'week_moving_trend', 'normed_week_mean', 'normed_week_median', 'week_trend'] \
+        + [f'relative_price_{col}' for col in ['L2', 'L3', 'L4', 'kind']]
+
+    file_path = f"./trend_coefs_{days_from_train}.csv"
+    if not os.path.exists(file_path):
+        print(f'Trend Fitting... Day {days_from_train}')
+        linear_trend(days_from_train, train)
+
+    coef_df = pd.read_csv(f'./trend_coefs_{days_from_train}.csv')
     train = train.merge(coef_df, how='left', on='unique_id')
     test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend_1'] = train['intercept'] * train['sell_price_main'] * train['ware_wgt'] ############### On weighted-scale
-    test['trend_1'] = test['intercept'] * test['sell_price_main'] * test['ware_wgt']
+    train[f'trend_{days_from_train}'] = train['intercept']
+    test[f'trend_{days_from_train}'] = test['intercept']
     for col in all_cols:
-        train['trend_1'] += train[col].fillna(0) * train[f'coef_{col}']
-        test['trend_1'] += test[col].fillna(0) * test[f'coef_{col}']
+        train[f'trend_{days_from_train}'] += np.sqrt(train[col].fillna(0)) * train[f'coef_{col}']
+        test[f'trend_{days_from_train}'] += np.sqrt(test[col].fillna(0)) * test[f'coef_{col}']
     drop_cols = ['intercept'] + [f'coef_{col}' for col in all_cols]
-    train.drop(drop_cols, axis=1, inplace=True)
-    test.drop(drop_cols, axis=1, inplace=True)
-    gc.collect()
-    # 2
-    nec_cols = ['product_sales_14', 'product_sales_21', 'product_sales_28', 'product_sales_35',
-                'weekday_avg_sales', 'week_trend', 'week_moving_trend', 'moving', 'normed_week_mean',
-                'normed_week_median'] + [f'lag_{i}' for i in [14, 21, 28, 35]]
-    coef_df = pd.read_csv('./trend_coefs_new.csv')
-    train = train.merge(coef_df, how='left', on='unique_id')
-    test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend_2'] = train['intercept'] * train['sell_price_main'] * train['ware_wgt']
-    test['trend_2'] = test['intercept'] * test['sell_price_main'] * test['ware_wgt']  # weight-scaled
-    for col in nec_cols:
-        train['trend_2'] += train[col].fillna(0) * train[f'coef_{col}']
-        test['trend_2'] += test[col].fillna(0) * test[f'coef_{col}']
-    drop_cols = ['intercept'] + [f'coef_{col}' for col in nec_cols]
-    train.drop(drop_cols, axis=1, inplace=True)
-    test.drop(drop_cols, axis=1, inplace=True)
-    gc.collect()
-
-    # newest
-    nec_cols = ['product_sales_14', 'product_sales_21', 'product_sales_28', 'product_sales_35',
-                'weekday_avg_sales', 'week_trend', 'week_moving_trend', 'moving', 'normed_week_mean',
-                'normed_week_median', 'discount_amount'] + [f'lag_{i}' for i in [14, 21, 28, 35]]
-    coef_df = pd.read_csv('./trend_coefs.csv')
-    train = train.merge(coef_df, how='left', on='unique_id')
-    test = test.merge(coef_df, how='left', on='unique_id')
-    train['trend_3'] = train['intercept']
-    test['trend_3'] = test['intercept']
-    for col in nec_cols: # PRE-WEIGHTED
-        train['trend_3'] += np.sqrt(train[col].fillna(0)) * train[f'coef_{col}']
-        test['trend_3'] += np.sqrt(test[col].fillna(0)) * test[f'coef_{col}']
-    drop_cols = ['intercept'] + [f'coef_{col}' for col in nec_cols]
     train.drop(drop_cols, axis=1, inplace=True)
     test.drop(drop_cols, axis=1, inplace=True)
 
@@ -572,7 +541,7 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame, date_end=None):
                        axis=1, inplace=True)
 
     # lags
-    PERIODS = [14, 17, 21, 28, 35, 42, 63, 91, 182, 364, 728]
+    PERIODS = list(range(1,22)) + [28, 35, 42, 63, 91, 182, 364]
     train_start = datetime.strptime(
         '08-01-2020', '%m-%d-%Y')
     train_end = datetime.strptime(
@@ -600,8 +569,8 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame, date_end=None):
     df['week_moving_trend'] = df['weekday_frac_sales'] * df['moving']
 
     # lags
-    DAY_PERIODS = [14, 21, 28, 35, 42]
-    OFF_PERIODS = [15, 16, 17, 18, 19, 20]
+    DAY_PERIODS = list(range(1, 14)) + [14, 21, 28, 35, 42]
+    OFF_PERIODS = list(range(15, 21))
     orders = df['total_orders']
     for shift in DAY_PERIODS:
         grouped = df[['unique_id', 'sales', 'total_orders']
@@ -626,7 +595,7 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame, date_end=None):
 
     df = df.drop([f'lag_{i}' for i in OFF_PERIODS], axis=1)
     df = df.drop(['dayofweek', 'year', 'weekday_frac_sales',
-                 'total_orders', 'city'], axis=1)
+                  'total_orders', 'city'], axis=1)
 
     train_info = df.loc[(df['date'] >= train_start)
                         & (df['date'] <= train_end)].drop('sales', axis=1)
@@ -649,6 +618,7 @@ def double_fe(train: pd.DataFrame, test: pd.DataFrame, date_end=None):
     # spectral embedding
     train, test = __spectral_embedding(train, test)
 
-    train, test = __trend(train, test)
+    for i in range(1, 15):
+        train, test = __trend(train, test, days_from_train=i)
 
     return train, test
