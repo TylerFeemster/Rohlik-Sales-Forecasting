@@ -481,10 +481,11 @@ def __target_encoding(train: pd.DataFrame, test: pd.DataFrame):
 
 def __trend(train: pd.DataFrame, test: pd.DataFrame, days_from_train: int = 14):
 
-    all_cols = [f'lag_{i}' for i in list(range(days_from_train, 15)) + [21, 28, 35]] \
+    sqrt_cols = [f'lag_{i}' for i in list(range(days_from_train, 15)) + [21, 28, 35]] \
         + [f'product_sales_{i}' for i in list(range(days_from_train, 22)) + [28, 35]] \
-        + ['weekday_avg_sales', 'total_orders', 'moving', 'week_moving_trend', 'normed_week_mean', 'normed_week_median', 'week_trend'] \
-        + [f'relative_price_{col}' for col in ['L2', 'L3', 'L4', 'kind']]
+        + ['weekday_avg_sales', 'total_orders', 'moving', 'week_moving_trend', 
+           'normed_week_mean', 'normed_week_median', 'week_trend']
+    no_sqrt = [f'relative_price_{col}' for col in ['L2', 'L3', 'L4', 'kind']]
 
     file_path = f"./trend_coefs_{days_from_train}.csv"
     if not os.path.exists(file_path):
@@ -496,10 +497,13 @@ def __trend(train: pd.DataFrame, test: pd.DataFrame, days_from_train: int = 14):
     test = test.merge(coef_df, how='left', on='unique_id')
     train[f'trend_{days_from_train}'] = train['intercept']
     test[f'trend_{days_from_train}'] = test['intercept']
-    for col in all_cols:
+    for col in no_sqrt:
+        train[f'trend_{days_from_train}'] += train[col].fillna(0) * train[f'coef_{col}']
+        test[f'trend_{days_from_train}'] += test[col].fillna(0) * test[f'coef_{col}']
+    for col in sqrt_cols:
         train[f'trend_{days_from_train}'] += np.sqrt(train[col].fillna(0)) * train[f'coef_{col}']
         test[f'trend_{days_from_train}'] += np.sqrt(test[col].fillna(0)) * test[f'coef_{col}']
-    drop_cols = ['intercept'] + [f'coef_{col}' for col in all_cols]
+    drop_cols = ['intercept'] + [f'coef_{col}' for col in no_sqrt + sqrt_cols]
     train.drop(drop_cols, axis=1, inplace=True)
     test.drop(drop_cols, axis=1, inplace=True)
 
