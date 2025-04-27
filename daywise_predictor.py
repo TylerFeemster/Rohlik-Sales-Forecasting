@@ -5,7 +5,6 @@ import gc
 from data_utils import add_holidays, process_calendar, process_inventory
 import lightgbm as lgb
 
-
 class FinalSubmitter:
 
     def __init__(self):
