@@ -4,6 +4,8 @@ This repo contains my solution to the Rohlik Sales Forecasting Challenge, hosted
 
 The goal of the competition was to predict the sales of over a thousand products over a future window of 14 days.
 
+In the end, I placed 24th out of nearly 800 participants, in the top 4%.
+
 ## My solution
 
 I used a single LightGBM gradient-boosted tree model as my foundation. Besides being the go-to choice for tabular data, there are some other strong reasons for choosing this model. First of all, the data is very heterogenous. We have product information, product relationships, geographic data, calendar data, order application data, etc. Any model that tries to directly combine numerical data with different units is a poor choice; all we care about is the relative ordering that a numerical column provides.
